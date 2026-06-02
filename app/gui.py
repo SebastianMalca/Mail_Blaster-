@@ -14,7 +14,8 @@ from pathlib import Path
 import webbrowser
 import tempfile
 
-from app.config import APP_NAME, APP_VERSION, COLORS, SMTP_DEFAULTS, SEND_DEFAULTS
+from app.config import (APP_NAME, APP_VERSION, COLORS, SMTP_DEFAULTS, SEND_DEFAULTS,
+                        LOCK_SMTP_SERVER, LARGE_RECIPIENT_THRESHOLD, DEFAULT_SUBJECT)
 from app.mail_sender import SMTPConfig, MailContent, MailSender, SendStats
 from app.excel_loader import ExcelLoader
 from app.settings_manager import save_settings, load_settings
@@ -225,41 +226,66 @@ class MailBlasterApp(ctk.CTk):
         sep1 = ctk.CTkFrame(parent, height=1, fg_color=COLORS["border"])
         sep1.pack(fill="x", padx=16, pady=(0, 8))
 
-        self._smtp_host = self._make_entry(parent, "Servidor SMTP (host)", "smtp.ejemplo.com")
-        self._smtp_port = self._make_entry(parent, "Puerto", "587")
-        self._smtp_user = self._make_entry(parent, "Usuario / Correo remitente", "usuario@ejemplo.com")
+        # Host y Puerto: bloqueados si la app es solo para uso institucional UNMSM
+        self._smtp_host = self._make_entry(
+            parent, "Servidor SMTP (host)",
+            SMTP_DEFAULTS["host"],
+            locked=LOCK_SMTP_SERVER,
+        )
+        self._smtp_port = self._make_entry(
+            parent, "Puerto",
+            SMTP_DEFAULTS["port"],
+            locked=LOCK_SMTP_SERVER,
+        )
+        self._smtp_user = self._make_entry(parent, "Usuario / Correo remitente", "usuario@unmsm.edu.pe")
         self._smtp_pass = self._make_entry(parent, "Contraseña", "", show="●")
 
-        # TLS / SSL switches
+        if LOCK_SMTP_SERVER:
+            ctk.CTkLabel(
+                parent,
+                text="🔒 Host y puerto fijados para Google Workspace UNMSM",
+                font=ctk.CTkFont(family="Segoe UI", size=10),
+                text_color=COLORS["warning"],
+                anchor="w",
+            ).pack(fill="x", padx=16, pady=(0, 4))
+
+        # TLS / SSL switches — mutuamente excluyentes
         tls_frame = ctk.CTkFrame(parent, fg_color="transparent")
         tls_frame.pack(fill="x", padx=16, pady=4)
 
-        self._tls_var = ctk.BooleanVar(value=True)
-        self._ssl_var = ctk.BooleanVar(value=False)
+        self._tls_var = ctk.BooleanVar(value=SMTP_DEFAULTS["use_tls"])
+        self._ssl_var = ctk.BooleanVar(value=SMTP_DEFAULTS["use_ssl"])
 
-        ctk.CTkSwitch(
+        self._tls_switch = ctk.CTkSwitch(
             tls_frame,
             text="Usar STARTTLS",
             variable=self._tls_var,
+            command=self._on_tls_toggled,
             font=ctk.CTkFont(family="Segoe UI", size=12),
             text_color=COLORS["text_primary"],
             button_color=COLORS["accent"],
             progress_color=COLORS["primary"],
-        ).pack(side="left", padx=(0, 16))
+        )
+        self._tls_switch.pack(side="left", padx=(0, 16))
 
-        ctk.CTkSwitch(
+        self._ssl_switch = ctk.CTkSwitch(
             tls_frame,
             text="Usar SSL/TLS directo",
             variable=self._ssl_var,
+            command=self._on_ssl_toggled,
             font=ctk.CTkFont(family="Segoe UI", size=12),
             text_color=COLORS["text_primary"],
             button_color=COLORS["accent"],
             progress_color=COLORS["primary"],
-        ).pack(side="left")
+        )
+        self._ssl_switch.pack(side="left")
 
-        # Botón probar conexión
+        # Botones de acción SMTP
+        smtp_btn_frame = ctk.CTkFrame(parent, fg_color="transparent")
+        smtp_btn_frame.pack(fill="x", padx=16, pady=(6, 10))
+
         ctk.CTkButton(
-            parent,
+            smtp_btn_frame,
             text="🔌  Probar Conexión",
             command=self._test_connection,
             height=34,
@@ -270,7 +296,21 @@ class MailBlasterApp(ctk.CTk):
             font=ctk.CTkFont(family="Segoe UI", size=12),
             border_width=1,
             border_color=COLORS["accent"],
-        ).pack(fill="x", padx=16, pady=(6, 10))
+        ).pack(side="left", expand=True, fill="x", padx=(0, 4))
+
+        ctk.CTkButton(
+            smtp_btn_frame,
+            text="📧  Correo de Prueba",
+            command=self._send_test_email,
+            height=34,
+            corner_radius=8,
+            fg_color=COLORS["surface_elevated"],
+            hover_color="#4A148C",
+            text_color=COLORS["text_primary"],
+            font=ctk.CTkFont(family="Segoe UI", size=12),
+            border_width=1,
+            border_color="#CE93D8",
+        ).pack(side="right", expand=True, fill="x", padx=(4, 0))
 
         # ════════════════════════════════════
         # SECCIÓN 2: Destinatarios
@@ -330,13 +370,21 @@ class MailBlasterApp(ctk.CTk):
         ).pack(fill="x", padx=16, pady=(2, 0))
         self._subject_entry = ctk.CTkEntry(
             parent,
-            placeholder_text="Asunto del correo masivo",
+            placeholder_text=f"Dejar vacío para usar: '{DEFAULT_SUBJECT}'",
             height=36,
             corner_radius=8,
             border_color=COLORS["border"],
             font=ctk.CTkFont(family="Segoe UI", size=13),
         )
-        self._subject_entry.pack(fill="x", padx=16, pady=(2, 8))
+        self._subject_entry.pack(fill="x", padx=16, pady=(2, 2))
+
+        ctk.CTkLabel(
+            parent,
+            text=f"💡 Si se deja vacío se usará: '{DEFAULT_SUBJECT}'",
+            font=ctk.CTkFont(family="Segoe UI", size=10),
+            text_color=COLORS["text_secondary"],
+            anchor="w",
+        ).pack(fill="x", padx=16, pady=(0, 6))
 
         # Botones de selección de archivo
         file_btn_frame = ctk.CTkFrame(parent, fg_color="transparent")
@@ -617,8 +665,8 @@ class MailBlasterApp(ctk.CTk):
     #  HELPERS: WIDGETS
     # ─────────────────────────────────────────────
 
-    def _make_entry(self, parent, label: str, placeholder: str = "", show: str = "") -> ctk.CTkEntry:
-        """Crea una entrada con etiqueta."""
+    def _make_entry(self, parent, label: str, placeholder: str = "", show: str = "", locked: bool = False) -> ctk.CTkEntry:
+        """Crea una entrada con etiqueta. Si locked=True, el campo queda como solo lectura."""
         ctk.CTkLabel(
             parent,
             text=f"{label}:",
@@ -631,11 +679,15 @@ class MailBlasterApp(ctk.CTk):
             placeholder_text=placeholder,
             height=36,
             corner_radius=8,
-            border_color=COLORS["border"],
+            border_color=COLORS["border"] if not locked else COLORS["warning"],
             font=ctk.CTkFont(family="Segoe UI", size=13),
             show=show,
+            state="normal",
         )
         entry.pack(fill="x", padx=16, pady=(2, 4))
+        if locked and placeholder:
+            entry.insert(0, placeholder)
+            entry.configure(state="disabled", text_color=COLORS["warning"])
         return entry
 
     # ─────────────────────────────────────────────
@@ -645,12 +697,14 @@ class MailBlasterApp(ctk.CTk):
     def _load_saved_settings(self):
         """Carga la configuración guardada en los campos de la UI."""
         s = self._saved_settings
-        self._smtp_host.insert(0, s.get("host", ""))
-        self._smtp_port.delete(0, "end")
-        self._smtp_port.insert(0, str(s.get("port", "587")))
+        # Host y puerto solo se cargan si no están bloqueados
+        if not LOCK_SMTP_SERVER:
+            self._smtp_host.insert(0, s.get("host", SMTP_DEFAULTS["host"]))
+            self._smtp_port.delete(0, "end")
+            self._smtp_port.insert(0, str(s.get("port", SMTP_DEFAULTS["port"])))
         self._smtp_user.insert(0, s.get("user", ""))
-        self._tls_var.set(s.get("use_tls", True))
-        self._ssl_var.set(s.get("use_ssl", False))
+        self._tls_var.set(s.get("use_tls", SMTP_DEFAULTS["use_tls"]))
+        self._ssl_var.set(s.get("use_ssl", SMTP_DEFAULTS["use_ssl"]))
 
     def _save_settings(self):
         """Guarda la configuración SMTP actual."""
@@ -846,7 +900,21 @@ class MailBlasterApp(ctk.CTk):
             ).pack(pady=20)
 
     # ─────────────────────────────────────────────
-    #  PRUEBA DE CONEXIÓN
+    #  MUTEX TLS / SSL
+    # ─────────────────────────────────────────────
+
+    def _on_tls_toggled(self):
+        """Si se activa STARTTLS, desactiva SSL/TLS directo."""
+        if self._tls_var.get():
+            self._ssl_var.set(False)
+
+    def _on_ssl_toggled(self):
+        """Si se activa SSL/TLS directo, desactiva STARTTLS."""
+        if self._ssl_var.get():
+            self._tls_var.set(False)
+
+    # ─────────────────────────────────────────────
+    #  PRUEBA DE CONEXIÓN Y CORREO DE PRUEBA
     # ─────────────────────────────────────────────
 
     def _test_connection(self):
@@ -879,7 +947,48 @@ class MailBlasterApp(ctk.CTk):
         else:
             self._log_box.append(f"❌ {msg}")
             self._statusbar_var.set(f"❌ {msg}")
-            messagebox.showerror("Error de Conexión", msg)
+            messagebox.showerror("Error de Conexión", f"{msg}\n\n(Error completo para diagnóstico)")
+
+    def _send_test_email(self):
+        """Envía un correo de prueba únicamente al remitente."""
+        cfg = self._get_smtp_config()
+        if not cfg:
+            return
+
+        confirm = messagebox.askyesno(
+            "Correo de Prueba",
+            f"Se enviará un correo de prueba únicamente a:\n\n  {cfg.user}\n\n"
+            "¿Continuar?"
+        )
+        if not confirm:
+            return
+
+        self._statusbar_var.set("📧 Enviando correo de prueba...")
+        self._log_box.append(f"📧 Enviando correo de prueba a: {cfg.user}")
+
+        def do_test():
+            from app.mail_sender import MailContent
+            dummy_sender = MailSender(
+                smtp_config=cfg,
+                mail_content=MailContent("Prueba", "html", ""),
+                recipients=[cfg.user],
+                batch_size=1,
+                wait_seconds=0,
+            )
+            ok, msg = dummy_sender.send_test_email()
+            self.after(0, lambda: self._on_test_email_result(ok, msg))
+
+        threading.Thread(target=do_test, daemon=True).start()
+
+    def _on_test_email_result(self, ok: bool, msg: str):
+        if ok:
+            self._log_box.append(f"✅ {msg}")
+            self._statusbar_var.set(f"✅ {msg}")
+            messagebox.showinfo("Correo de Prueba", f"{msg}\n\nRevisa tu bandeja de entrada.")
+        else:
+            self._log_box.append(f"❌ {msg}")
+            self._statusbar_var.set(f"❌ Error en correo de prueba")
+            messagebox.showerror("Error en Correo de Prueba", msg)
 
     # ─────────────────────────────────────────────
     #  VALIDACIÓN Y CONSTRUCCIÓN DE OBJETOS
@@ -960,7 +1069,7 @@ class MailBlasterApp(ctk.CTk):
 
         batch_size, wait_seconds = batch_cfg
 
-        # Confirmación
+        # ── Confirmación estándar ──
         confirm = messagebox.askyesno(
             "Confirmar Envío Masivo",
             f"¿Confirmar el envío masivo?\n\n"
@@ -973,6 +1082,20 @@ class MailBlasterApp(ctk.CTk):
         )
         if not confirm:
             return
+
+        # ── Doble confirmación de seguridad para listas grandes ──
+        if len(self._recipients) > LARGE_RECIPIENT_THRESHOLD:
+            second_confirm = messagebox.askyesno(
+                "⚠️ ADVERTENCIA — Lista grande",
+                f"Estás a punto de enviar correos a {len(self._recipients):,} destinatarios.\n"
+                f"Esto supera el umbral de seguridad de {LARGE_RECIPIENT_THRESHOLD:,}.\n\n"
+                "¿Estás COMPLETAMENTE SEGURO de que deseas continuar?\n"
+                "Esta acción NO se puede deshacer.",
+                icon="warning",
+            )
+            if not second_confirm:
+                self._log_box.append("ℹ️ Envío cancelado en la segunda confirmación de seguridad.")
+                return
 
         # Bloquear UI
         self._set_sending_mode(True)

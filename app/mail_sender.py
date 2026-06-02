@@ -33,6 +33,10 @@ class SMTPConfig:
         self.port = port
         self.user = user
         self.password = password
+        # Garantizar que TLS y SSL no estén activos al mismo tiempo.
+        # SSL tiene prioridad si ambos se activan accidentalmente.
+        if use_ssl and use_tls:
+            use_tls = False
         self.use_tls = use_tls
         self.use_ssl = use_ssl
 
@@ -52,14 +56,16 @@ class SMTPConfig:
 class MailContent:
     """Contenido del correo a enviar."""
 
+    DEFAULT_SUBJECT = "Comunicado Institucional"
+
     def __init__(self, subject: str, content_type: str, content_path: str):
-        self.subject = subject
+        # El asunto es opcional: si está vacío se usa el valor por defecto
+        self.subject = subject.strip() if subject.strip() else self.DEFAULT_SUBJECT
         self.content_type = content_type  # 'html' o 'image'
         self.content_path = content_path
 
     def validate(self) -> tuple[bool, str]:
-        if not self.subject.strip():
-            return False, "El asunto del correo es requerido."
+        # El asunto ya tiene un valor por defecto, nunca estará vacío
         if not self.content_path:
             return False, "Debe seleccionar un archivo HTML o imagen."
         if not Path(self.content_path).exists():
@@ -169,21 +175,42 @@ class MailSender:
         return msg
 
     def _connect_smtp(self) -> smtplib.SMTP:
-        """Crea y devuelve una conexión SMTP autenticada."""
+        """Crea y devuelve una conexión SMTP autenticada.
+
+        NOTA DE DIAGNÓSTICO (v1 funcional):
+        Se desactiva temporalmente la verificación SSL para facilitar el diagnóstico
+        de errores de certificado en el entorno institucional.
+        Reactivar cuando el entorno esté estabilizado:
+            context = ssl.create_default_context()   # verificación completa
+        """
         cfg = self.smtp_config
+
+        # Contexto SSL con verificación desactivada para diagnóstico
         context = ssl.create_default_context()
+        context.check_hostname = False
+        context.verify_mode = ssl.CERT_NONE
 
-        if cfg.use_ssl:
-            server = smtplib.SMTP_SSL(cfg.host, cfg.port, context=context, timeout=30)
-        else:
-            server = smtplib.SMTP(cfg.host, cfg.port, timeout=30)
-            if cfg.use_tls:
-                server.ehlo()
-                server.starttls(context=context)
-                server.ehlo()
+        try:
+            if cfg.use_ssl:
+                # SSL/TLS directo (puerto 465 típicamente)
+                server = smtplib.SMTP_SSL(cfg.host, cfg.port, context=context, timeout=30)
+            else:
+                server = smtplib.SMTP(cfg.host, cfg.port, timeout=30)
+                if cfg.use_tls:
+                    # STARTTLS (puerto 587 típicamente)
+                    server.ehlo()
+                    server.starttls(context=context)
+                    server.ehlo()
 
-        server.login(cfg.user, cfg.password)
-        return server
+            server.login(cfg.user, cfg.password)
+            return server
+
+        except smtplib.SMTPAuthenticationError as e:
+            # Mostrar código y detalle completo para diagnóstico
+            raise smtplib.SMTPAuthenticationError(e.smtp_code, e.smtp_error) from e
+        except smtplib.SMTPException as e:
+            # Re-lanzar con mensaje completo para diagnóstico
+            raise smtplib.SMTPException(f"[SMTP {type(e).__name__}] {e}") from e
 
     def test_connection(self) -> tuple[bool, str]:
         """Prueba la conexión SMTP sin enviar correos."""
@@ -191,12 +218,52 @@ class MailSender:
             server = self._connect_smtp()
             server.quit()
             return True, "Conexión exitosa al servidor SMTP."
-        except smtplib.SMTPAuthenticationError:
-            return False, "Error de autenticación: usuario o contraseña incorrectos."
+        except smtplib.SMTPAuthenticationError as e:
+            return False, f"Error de autenticación ({e.smtp_code}): {e.smtp_error}"
         except smtplib.SMTPConnectError as e:
             return False, f"Error al conectar al servidor: {e}"
         except Exception as e:
-            return False, f"Error inesperado: {e}"
+            # Mostrar excepción completa durante el desarrollo
+            return False, f"Error ({type(e).__name__}): {e}"
+
+    def send_test_email(self) -> tuple[bool, str]:
+        """Envía un correo de prueba únicamente al remitente para verificar antes del envío masivo."""
+        try:
+            server = self._connect_smtp()
+        except Exception as e:
+            return False, f"Error al conectar ({type(e).__name__}): {e}"
+
+        try:
+            # Construir mensaje de prueba dirigido al propio remitente
+            msg = MIMEMultipart("mixed")
+            msg["Subject"] = f"[PRUEBA] {self.mail_content.subject}"
+            msg["From"] = self.smtp_config.user
+            msg["To"] = self.smtp_config.user
+
+            body = (
+                "<html><body style='font-family:Arial,sans-serif;padding:20px;'>"
+                "<h2 style='color:#1565C0;'>✅ Correo de prueba</h2>"
+                "<p>Este es un correo de prueba enviado desde <strong>Mail Blaster Institucional</strong>.</p>"
+                "<p>Si lo recibes correctamente, la configuración SMTP está funcionando.</p>"
+                f"<hr><small>Servidor: {self.smtp_config.host}:{self.smtp_config.port} | "
+                f"STARTTLS: {'Sí' if self.smtp_config.use_tls else 'No'} | "
+                f"SSL: {'Sí' if self.smtp_config.use_ssl else 'No'}</small>"
+                "</body></html>"
+            )
+            msg_alt = MIMEMultipart("alternative")
+            msg_alt.attach(MIMEText("Correo de prueba de Mail Blaster Institucional.", "plain", "utf-8"))
+            msg_alt.attach(MIMEText(body, "html", "utf-8"))
+            msg.attach(msg_alt)
+
+            server.sendmail(self.smtp_config.user, self.smtp_config.user, msg.as_string())
+            server.quit()
+            return True, f"Correo de prueba enviado a: {self.smtp_config.user}"
+        except Exception as e:
+            try:
+                server.quit()
+            except Exception:
+                pass
+            return False, f"Error al enviar prueba ({type(e).__name__}): {e}"
 
     def run(self):
         """Ejecuta el envío masivo. Debe llamarse desde un hilo separado."""
@@ -204,6 +271,9 @@ class MailSender:
         self._log("Iniciando proceso de envío masivo...")
         self._log(f"Total de destinatarios: {self.stats.total}")
         self._log(f"Tamaño de lote: {self.batch_size} | Espera entre lotes: {self.wait_seconds}s")
+        self._log(f"Servidor: {self.smtp_config.host}:{self.smtp_config.port} | "
+                  f"STARTTLS: {'Sí' if self.smtp_config.use_tls else 'No'} | "
+                  f"SSL: {'Sí' if self.smtp_config.use_ssl else 'No'}")
 
         batches = [
             self.recipients[i : i + self.batch_size]
@@ -221,7 +291,8 @@ class MailSender:
             try:
                 server = self._connect_smtp()
             except Exception as e:
-                self._log(f"❌ Error al conectar al servidor SMTP: {e}")
+                # Mostrar error SMTP completo para diagnóstico
+                self._log(f"❌ Error al conectar al servidor SMTP [{type(e).__name__}]: {e}")
                 # Marcar todos del lote como fallidos
                 for _ in batch:
                     self.stats.record_failed()
@@ -246,9 +317,13 @@ class MailSender:
                     server.sendmail(self.smtp_config.user, recipient, msg.as_string())
                     self.stats.record_sent()
                     self._log(f"✅ Enviado a: {recipient}")
+                except smtplib.SMTPException as e:
+                    self.stats.record_failed()
+                    # Error SMTP completo para diagnóstico
+                    self._log(f"❌ Error SMTP enviando a {recipient} [{type(e).__name__}]: {e}")
                 except Exception as e:
                     self.stats.record_failed()
-                    self._log(f"❌ Error enviando a {recipient}: {e}")
+                    self._log(f"❌ Error enviando a {recipient} [{type(e).__name__}]: {e}")
 
                 self._notify_progress()
 

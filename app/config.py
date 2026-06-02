@@ -25,21 +25,33 @@ COLORS = {
 }
 
 # Valores por defecto de configuración SMTP
+# Preconfigurado para Google Workspace / Gmail institucional UNMSM
 SMTP_DEFAULTS = {
-    "host": "",
+    "host": "smtp.gmail.com",
     "port": "587",
     "user": "",
     "password": "",
-    "use_tls": True,
-    "use_ssl": False,
+    "use_tls": True,   # STARTTLS activo
+    "use_ssl": False,  # SSL/TLS directo desactivado
 }
 
 # Valores por defecto de envío
+# Configuración conservadora para diagnóstico inicial
 SEND_DEFAULTS = {
-    "batch_size": 50,
-    "wait_seconds": 10,
-    "subject": "",
+    "batch_size": 25,        # Reducido de 50 a 25 para diagnóstico
+    "wait_seconds": 30,      # Aumentado de 10 a 30s para no saturar el servidor
+    "subject": "Comunicado Institucional",  # Asunto por defecto
 }
 
 # Configuración de archivo de guardado
 SETTINGS_FILE = "smtp_settings.json"
+
+# Umbral para doble confirmación de seguridad
+LARGE_RECIPIENT_THRESHOLD = 500
+
+# Asunto por defecto si el usuario no escribe ninguno
+DEFAULT_SUBJECT = "Comunicado Institucional"
+
+# SMTP bloqueado: host y puerto fijos para uso institucional UNMSM
+# Cambiar a False para permitir editar host/puerto libremente
+LOCK_SMTP_SERVER = True
