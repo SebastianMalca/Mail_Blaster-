@@ -48,8 +48,9 @@ class ExcelLoader:
         except Exception as e:
             return False, f"Error al leer el archivo Excel: {e}"
 
-        # Normalizar nombres de columna: lowercase y sin espacios
-        df.columns = [c.strip().lower() for c in df.columns]
+        # Normalizar nombres de columna: lowercase, sin espacios y sin puntuación al final
+        # Esto permite detectar columnas como "Correo:", "Correo :", "CORREO", etc.
+        df.columns = [c.strip().lower().rstrip(":.,;") .strip() for c in df.columns]
 
         if self.REQUIRED_COLUMN not in df.columns:
             cols = ", ".join(df.columns.tolist())

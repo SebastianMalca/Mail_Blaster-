@@ -14,7 +14,6 @@ from email.mime.base import MIMEBase
 from email import encoders
 from pathlib import Path
 from typing import Callable, List, Optional
-import base64
 
 
 class SMTPConfig:
@@ -58,18 +57,34 @@ class MailContent:
 
     DEFAULT_SUBJECT = "Comunicado Institucional"
 
-    def __init__(self, subject: str, content_type: str, content_path: str):
+    def __init__(
+        self,
+        subject: str,
+        content_type: str,
+        content_path: str,
+        image_paths: Optional[List[str]] = None,
+    ):
         # El asunto es opcional: si está vacío se usa el valor por defecto
         self.subject = subject.strip() if subject.strip() else self.DEFAULT_SUBJECT
         self.content_type = content_type  # 'html' o 'image'
-        self.content_path = content_path
+        self.content_path = content_path   # ruta del HTML
+        # Para imágenes: lista de rutas (soporta múltiples imágenes)
+        self.image_paths: List[str] = image_paths if image_paths else []
 
     def validate(self) -> tuple[bool, str]:
-        # El asunto ya tiene un valor por defecto, nunca estará vacío
-        if not self.content_path:
+        if self.content_type == "html":
+            if not self.content_path:
+                return False, "Debe seleccionar un archivo HTML o imagen."
+            if not Path(self.content_path).exists():
+                return False, f"El archivo '{self.content_path}' no existe."
+        elif self.content_type == "image":
+            if not self.image_paths:
+                return False, "Debe seleccionar al menos una imagen."
+            for p in self.image_paths:
+                if not Path(p).exists():
+                    return False, f"La imagen '{p}' no existe."
+        else:
             return False, "Debe seleccionar un archivo HTML o imagen."
-        if not Path(self.content_path).exists():
-            return False, f"El archivo '{self.content_path}' no existe."
         return True, ""
 
 
@@ -113,6 +128,8 @@ class MailSender:
         on_progress: Optional[Callable] = None,
         on_log: Optional[Callable] = None,
         on_finished: Optional[Callable] = None,
+        on_limit_reached: Optional[Callable] = None,
+        max_emails: int = 0,
     ):
         self.smtp_config = smtp_config
         self.mail_content = mail_content
@@ -122,6 +139,9 @@ class MailSender:
         self.on_progress = on_progress
         self.on_log = on_log
         self.on_finished = on_finished
+        self.on_limit_reached = on_limit_reached
+        # max_emails = 0 significa sin límite
+        self.max_emails = max_emails if max_emails and max_emails > 0 else 0
         self._cancel_event = threading.Event()
         self.stats = SendStats(len(recipients))
 
@@ -153,24 +173,54 @@ class MailSender:
             msg.attach(msg_alt)
 
         elif self.mail_content.content_type == "image":
-            path = self.mail_content.content_path
-            ext = Path(path).suffix.lower().lstrip(".")
-            mime_type = "jpeg" if ext in ("jpg", "jpeg") else ext
+            # ── CID (Content-ID) inline — solución correcta para imágenes en correo ──
+            #
+            # PROBLEMA anterior: base64 inline en el HTML
+            #   → correos de varios MB → Gmail los recorta a 102 KB
+            #   → el base64 queda cortado → imágenes rotas
+            #
+            # SOLUCIÓN: cada imagen viaja como parte MIME adjunta independiente
+            # con un Content-ID único. El HTML solo lleva una referencia corta:
+            #   <img src="cid:image_0"> en lugar de src="data:image/...base64,AAAAA..."
+            # Todos los clientes de correo (Gmail, Outlook, Apple Mail) lo soportan.
 
-            with open(path, "rb") as f:
-                img_data = f.read()
+            img_tags = []
+            image_parts = []
 
-            img_b64 = base64.b64encode(img_data).decode()
+            for i, path in enumerate(self.mail_content.image_paths):
+                cid = f"image_{i}"
+                ext = Path(path).suffix.lower().lstrip(".")
+                mime_subtype = "jpeg" if ext in ("jpg", "jpeg") else ext
+
+                with open(path, "rb") as f:
+                    img_data = f.read()
+
+                img_part = MIMEImage(img_data, _subtype=mime_subtype)
+                img_part.add_header("Content-ID", f"<{cid}>")
+                img_part.add_header(
+                    "Content-Disposition", "inline",
+                    filename=Path(path).name,
+                )
+                image_parts.append(img_part)
+
+                img_tags.append(
+                    f'<img src="cid:{cid}" '
+                    f'style="max-width:100%;display:block;margin:0 auto;" alt="Comunicado"/>'
+                )
+
             html_body = (
-                f'<html><body style="margin:0;padding:0;background:#fff;">'
-                f'<img src="data:image/{mime_type};base64,{img_b64}" '
-                f'style="max-width:100%;display:block;margin:auto;" alt="Comunicado"/>'
-                f"</body></html>"
+                '<html><body style="margin:0;padding:0;background:#fff;">'
+                + "".join(img_tags)
+                + "</body></html>"
             )
             msg_alt = MIMEMultipart("alternative")
             msg_alt.attach(MIMEText("Este correo requiere un cliente compatible con HTML.", "plain", "utf-8"))
             msg_alt.attach(MIMEText(html_body, "html", "utf-8"))
             msg.attach(msg_alt)
+
+            # Adjuntar cada imagen como parte MIME referenciada por su CID
+            for img_part in image_parts:
+                msg.attach(img_part)
 
         return msg
 
@@ -317,6 +367,24 @@ class MailSender:
                     server.sendmail(self.smtp_config.user, recipient, msg.as_string())
                     self.stats.record_sent()
                     self._log(f"✅ Enviado a: {recipient}")
+
+                    # — Comprobar límite máximo de correos por sesión —
+                    if self.max_emails and self.stats.sent >= self.max_emails:
+                        self._log(
+                            f"⚠️ Límite de {self.max_emails} correos enviados alcanzado. "
+                            "Deteniendo el envio."
+                        )
+                        self._notify_progress()
+                        try:
+                            server.quit()
+                        except Exception:
+                            pass
+                        if self.on_limit_reached:
+                            self.on_limit_reached(self.stats, self.max_emails)
+                        else:
+                            if self.on_finished:
+                                self.on_finished(self.stats, cancelled=False)
+                        return
                 except smtplib.SMTPException as e:
                     self.stats.record_failed()
                     # Error SMTP completo para diagnóstico

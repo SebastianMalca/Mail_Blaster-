@@ -41,6 +41,7 @@ SEND_DEFAULTS = {
     "batch_size": 25,        # Reducido de 50 a 25 para diagnóstico
     "wait_seconds": 30,      # Aumentado de 10 a 30s para no saturar el servidor
     "subject": "Comunicado Institucional",  # Asunto por defecto
+    "max_emails": 500,       # Límite máximo de correos por sesión (0 = sin límite)
 }
 
 # Configuración de archivo de guardado
